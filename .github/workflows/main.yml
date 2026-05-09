@@ -1,0 +1,161 @@
+name: Build Fedora 44 AppImage
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'deps/**'
+      - 'src/**'
+      - '**/CMakeLists.txt'
+      - 'version.inc'
+      - 'localization/**'
+      - 'resources/**'
+      - 'BuildLinux.sh'
+      - 'linux.d/**'
+      - '.github/workflows/build_linux.yml'
+
+  workflow_dispatch:
+    inputs:
+      clean-build:
+        description: 'Force a clean build (ignore caches)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_fedora:
+    name: Build Fedora 44 AppImage
+    runs-on: ubuntu-22.04
+    container:
+      image: fedora:44
+      # Container runs as root by default — fine, since we're installing system packages.
+    timeout-minutes: 360
+
+    steps:
+      # The base fedora image is minimal: no git, no sudo, no toolchain.
+      # Install the bare minimum needed before checkout so actions/checkout works.
+      - name: Bootstrap container basics
+        run: |
+          dnf -y install \
+            sudo git git-lfs which findutils file \
+            tar gzip xz unzip \
+            ca-certificates \
+            procps-ng util-linux
+          git --version
+          git lfs version
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: 'true'
+
+      # Make sure we have the build essentials regardless of what linux.d/fedora
+      # does (or doesn't do — it may not exist upstream).
+      - name: Install build toolchain
+        run: |
+          dnf -y group install development-tools || \
+            dnf -y groupinstall "Development Tools"
+          dnf -y install \
+            cmake ninja-build \
+            gcc gcc-c++ make autoconf automake libtool \
+            perl perl-FindBin perl-IPC-Cmd perl-Pod-Html \
+            python3 python3-pip \
+            gettext gettext-devel \
+            texinfo bison flex \
+            pkgconf-pkg-config m4 \
+            patch
+          cmake --version
+          ninja --version
+
+      - name: Detect Fedora support in BuildLinux.sh
+        id: detect
+        # The script reads /etc/os-release ID= ("fedora" on this image) and
+        # sources ./linux.d/fedora. If that file doesn't exist, it exits 1.
+        run: |
+          if [ -f ./linux.d/fedora ]; then
+            echo "Found linux.d/fedora — using BuildLinux.sh -u for system deps."
+            echo "has_fedora_recipe=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No linux.d/fedora — installing Fedora equivalents manually."
+            echo "has_fedora_recipe=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install system dependencies (via BuildLinux.sh -u)
+        if: steps.detect.outputs.has_fedora_recipe == 'true'
+        run: ./BuildLinux.sh -u
+
+      - name: Install system dependencies (manual Fedora equivalents)
+        if: steps.detect.outputs.has_fedora_recipe == 'false'
+        # Fedora package equivalents to the Ubuntu deps the README lists.
+        # NOTE: Fedora 44 ships webkit2gtk 6.x by default; the build expects
+        # webkit2gtk-4.0 (libwebkit2gtk-4.0-dev on Ubuntu). webkit2gtk4.0-devel
+        # may not exist in F44 repos. We try variants in order; if all fail
+        # the build will fail at link time and you'll need to patch the source
+        # to use a newer webkit2gtk. This is the #1 likely failure point.
+        run: |
+          set -e
+          dnf -y install \
+            libmspack-devel \
+            gstreamer1-devel \
+            libsecret-devel \
+            mesa-libOSMesa-devel \
+            openssl-devel \
+            libcurl-devel \
+            systemd-devel \
+            dbus-devel \
+            extra-cmake-modules \
+            gtk3-devel \
+            glew-devel \
+            wxGTK-devel \
+            boost-devel \
+            tbb-devel \
+            cairo-devel \
+            pango-devel \
+            eudev-libs \
+            libudev-devel || true
+
+          # webkit2gtk: try 4.0, 4.1, then 6.0 — install whichever is available.
+          dnf -y install webkit2gtk4.0-devel || \
+          dnf -y install webkit2gtk4.1-devel || \
+          dnf -y install webkit2gtk6.0-devel || \
+            { echo "ERROR: no webkit2gtk*-devel package available — build will fail."; exit 1; }
+
+          # eglexternalplatform may be named differently on Fedora; non-fatal.
+          dnf -y install eglexternalplatform-devel || \
+            echo "WARN: eglexternalplatform-devel not found; continuing."
+
+      - name: Cache deps build directory
+        if: ${{ !inputs.clean-build }}
+        uses: actions/cache@v4
+        with:
+          path: deps/build
+          key: fedora44-deps-${{ hashFiles('deps/**', 'linux.d/**', 'BuildLinux.sh') }}
+          restore-keys: |
+            fedora44-deps-
+
+      - name: Build deps + slicer + AppImage
+        # -d build deps, -s build slicer, -i generate AppImage, -r skip RAM/disk check.
+        run: ./BuildLinux.sh -dsir
+
+      - name: Show what got built
+        if: always()
+        run: |
+          echo "=== AppImages found ==="
+          find . -name '*.AppImage' 2>/dev/null || true
+          echo "=== build/ tree ==="
+          find build -maxdepth 4 -type f \( -name '*.AppImage' -o -name 'CrealityPrint' \) 2>/dev/null || true
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: CrealityPrint-Fedora44-AppImage
+          path: |
+            build/**/*.AppImage
+            **/*.AppImage
+          if-no-files-found: warn
+          retention-days: 14

@@ -54,6 +54,17 @@ jobs:
         with:
           lfs: 'true'
 
+      - name: Restore executable bits on shell scripts
+        # actions/checkout + git-lfs sometimes strips +x from tracked shell scripts,
+        # producing 'Permission denied' (exit 126) when invoking ./BuildLinux.sh.
+        # Belt-and-suspenders fix: chmod every .sh in the repo root and known subdirs.
+        run: |
+          chmod +x BuildLinux.sh BuildLinux_clang.sh DockerBuild.sh DockerRun.sh \
+                   run_gettext.sh uos.sh 2>/dev/null || true
+          # Anything else tracked as a shell script:
+          find . -maxdepth 3 -type f -name '*.sh' -exec chmod +x {} +
+          ls -l BuildLinux.sh
+
       # Make sure we have the build essentials regardless of what linux.d/fedora
       # does (or doesn't do — it may not exist upstream).
       - name: Install build toolchain
